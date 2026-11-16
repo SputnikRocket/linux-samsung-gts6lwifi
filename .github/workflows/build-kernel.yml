@@ -1,0 +1,251 @@
+name: Build kernel + boot.img (gts6lwifi / SM-T860)
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig name from arch/arm64/configs"
+        type: string
+        default: gts6lwifi_eur_open_defconfig
+      extra_config:
+        description: "Extra Kconfig options, space separated (e.g. CONFIG_SECURITY_DEFEX=n CONFIG_FOO=y)"
+        type: string
+        default: ""
+      extra_make_args:
+        description: "Extra make arguments, space separated (e.g. KCFLAGS=-Wno-error)"
+        type: string
+        default: ""
+      stock_boot_url:
+        description: "URL of the stock boot.img (only used if stock/boot.img is not in the repo)"
+        type: string
+        default: ""
+      ramdisk_url:
+        description: "Optional replacement ramdisk/initramfs URL (cpio, gz, lz4, xz...). Empty = keep the stock ramdisk"
+        type: string
+        default: ""
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "Documentation/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Qualcomm's LLVM 8 (what Samsung builds with) is not public, so use AOSP's
+  # prebuilt clang + GCC 4.9 binutils, which build 4.14 SM8150 trees fine.
+  CLANG_VER: clang-r353983c
+  CLANG_BRANCH: android10-release
+  GCC_BRANCH: android10-release
+  MAGISK_VERSION: v27.0
+  STOCK_BOOT_PATH: stock/boot.img
+  DTB_GLOB: "*gts6*.dtb"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      DEFCONFIG: ${{ inputs.defconfig || 'gts6lwifi_eur_open_defconfig' }}
+      EXTRA_CONFIG: ${{ inputs.extra_config }}
+      EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
+      STOCK_BOOT_URL: ${{ inputs.stock_boot_url || vars.STOCK_BOOT_URL }}
+      RAMDISK_URL: ${{ inputs.ramdisk_url || vars.RAMDISK_URL }}
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev libncurses-dev \
+            xz-utils unzip curl git ca-certificates python3 python-is-python3 \
+            gcc-arm-linux-gnueabi
+
+      - name: Restore toolchain cache
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains
+          key: toolchains-${{ env.CLANG_VER }}-${{ env.CLANG_BRANCH }}-gcc4.9-${{ env.GCC_BRANCH }}
+
+      - name: Download toolchains
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          TC="$HOME/toolchains"
+          mkdir -p "$TC/clang"
+          curl -fL --retry 3 \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/${CLANG_BRANCH}/${CLANG_VER}.tar.gz" \
+            | tar -xz -C "$TC/clang"
+          git clone --depth=1 -b "$GCC_BRANCH" \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            "$TC/gcc64"
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          TC="$HOME/toolchains"
+          export PATH="$TC/clang/bin:$TC/gcc64/bin:$PATH"
+          clang --version | head -n1
+          aarch64-linux-android-gcc --version | head -n1
+
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
+            echo "::error::arch/arm64/configs/$DEFCONFIG not found. Closest matches:"
+            ls arch/arm64/configs | grep -i -e gts6 -e t860 -e sm8150 || true
+            exit 1
+          fi
+
+          make_args=(
+            -j"$(nproc)"
+            O=out ARCH=arm64
+            CC=clang REAL_CC=clang
+            HOSTCC="gcc -fcommon"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CONFIG_BUILD_ARM64_DT_OVERLAY=y
+          )
+          # Samsung ships a prebuilt dtc in tools/ and builds with DTC_EXT
+          if [ -f tools/dtc ]; then
+            chmod +x tools/dtc
+            make_args+=(DTC_EXT="$PWD/tools/dtc")
+          fi
+          if [ -n "${EXTRA_MAKE_ARGS:-}" ]; then
+            read -r -a extra <<<"$EXTRA_MAKE_ARGS"
+            make_args+=("${extra[@]}")
+          fi
+
+          make "${make_args[@]}" "$DEFCONFIG"
+
+          if [ -n "${EXTRA_CONFIG:-}" ]; then
+            tr ' ' '\n' <<<"$EXTRA_CONFIG" >> out/.config
+            make "${make_args[@]}" olddefconfig
+          fi
+
+          make "${make_args[@]}" 2>&1 | tee build.log
+
+          # ---- collect outputs ----
+          B=out/arch/arm64/boot
+          [ -f "$B/Image" ] || { echo "::error::build finished without producing $B/Image"; exit 1; }
+          mkdir -p dist/dtbs
+          for f in Image Image.gz Image.gz-dtb Image-dtb; do
+            if [ -f "$B/$f" ]; then cp "$B/$f" dist/; fi
+          done
+          find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp -t dist/dtbs {} +
+          cp out/.config dist/config
+          make "${make_args[@]}" -s kernelrelease 2>/dev/null | tail -n1 > dist/kernelrelease.txt || true
+
+          if grep -q '^CONFIG_MODULES=y' out/.config; then
+            make "${make_args[@]}" INSTALL_MOD_PATH="$PWD/dist/modules" INSTALL_MOD_STRIP=1 modules_install \
+              || echo "::warning::modules_install failed (continuing)"
+          fi
+          ls -lh dist dist/dtbs
+
+      - name: Locate stock boot.img
+        id: stock
+        run: |
+          set -euo pipefail
+          path=""
+          if [ -f "$STOCK_BOOT_PATH" ]; then
+            path="$GITHUB_WORKSPACE/$STOCK_BOOT_PATH"
+          elif [ -n "${STOCK_BOOT_URL:-}" ]; then
+            curl -fL --retry 3 -o "$RUNNER_TEMP/stock-boot.img" "$STOCK_BOOT_URL"
+            path="$RUNNER_TEMP/stock-boot.img"
+          fi
+          if [ -n "$path" ]; then
+            head -c 8 "$path" | grep -q 'ANDROID!' || { echo "::error::$path is not an Android boot image"; exit 1; }
+          else
+            echo "::notice::No stock boot.img (stock/boot.img or STOCK_BOOT_URL) - skipping boot.img repack"
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: Repack boot.img
+        if: steps.stock.outputs.path != ''
+        env:
+          STOCK: ${{ steps.stock.outputs.path }}
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/bootimg"
+          B="$GITHUB_WORKSPACE/out/arch/arm64/boot"
+          rm -rf "$WORK"; mkdir -p "$WORK/unpacked" "$GITHUB_WORKSPACE/dist"
+
+          # magiskboot: static x86_64 binary shipped inside the Magisk APK
+          curl -fL --retry 3 -o "$WORK/magisk.apk" \
+            "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VERSION}/Magisk-${MAGISK_VERSION}.apk"
+          unzip -p "$WORK/magisk.apk" lib/x86_64/libmagiskboot.so > "$WORK/magiskboot"
+          chmod +x "$WORK/magiskboot"
+          MB="$WORK/magiskboot"
+
+          # DTBs exactly as the kernel build would append them, if it did; else glob the dts output
+          dtb_blob() {
+            if [ -f "$B/Image.gz-dtb" ]; then
+              tail -c +$(( $(stat -c %s "$B/Image.gz") + 1 )) "$B/Image.gz-dtb"
+            elif [ -f "$B/Image-dtb" ]; then
+              tail -c +$(( $(stat -c %s "$B/Image") + 1 )) "$B/Image-dtb"
+            else
+              mapfile -t files < <(find "$B/dts" -name "$DTB_GLOB" | sort)
+              if [ "${#files[@]}" -eq 0 ]; then
+                echo "::warning::no DTB matched $DTB_GLOB, using every .dtb" >&2
+                mapfile -t files < <(find "$B/dts" -name '*.dtb' | sort)
+              fi
+              cat "${files[@]}"
+            fi
+          }
+
+          cd "$WORK/unpacked"
+          "$MB" unpack -h "$STOCK" 2>&1 | tee ../unpack.log
+          echo "--- stock components ---"; ls -l
+
+          # magiskboot hands us a decompressed kernel and recompresses it
+          # in the original format on repack, so always give it the raw Image.
+          cp "$B/Image" kernel
+
+          if [ -f kernel_dtb ] || [ -f dtb ]; then
+            dtb_blob > "$WORK/dtb.new"
+            [ -s "$WORK/dtb.new" ] || { echo "::error::empty DTB blob"; exit 1; }
+            [ "$(head -c 4 "$WORK/dtb.new" | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ] || { echo "::error::DTB blob has no FDT magic"; exit 1; }
+            if [ -f kernel_dtb ]; then cp "$WORK/dtb.new" kernel_dtb; fi
+            if [ -f dtb ]; then cp "$WORK/dtb.new" dtb; fi
+          else
+            echo "::warning::stock boot.img exposes no DTB component; only the kernel was replaced"
+          fi
+
+          if [ -n "${RAMDISK_URL:-}" ]; then
+            curl -fL --retry 3 -o "$WORK/ramdisk.in" "$RAMDISK_URL"
+            if head -c 6 "$WORK/ramdisk.in" | grep -q '^07070[12]'; then
+              cp "$WORK/ramdisk.in" ramdisk.cpio
+            else
+              "$MB" decompress "$WORK/ramdisk.in" ramdisk.cpio
+            fi
+          fi
+
+          "$MB" repack "$STOCK" "$GITHUB_WORKSPACE/dist/boot.img"
+
+          # sanity check: the result must unpack again
+          mkdir -p "$WORK/verify"; cd "$WORK/verify"
+          "$MB" unpack "$GITHUB_WORKSPACE/dist/boot.img" >/dev/null
+          ls -l
+          cd "$GITHUB_WORKSPACE/dist"
+          ls -l "$STOCK" boot.img
+          sha256sum boot.img | tee boot.img.sha256
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gts6lwifi-kernel-${{ github.run_number }}
+          path: |
+            dist/
+            build.log
+          if-no-files-found: warn
+          retention-days: 30
