@@ -15,6 +15,10 @@ on:
         description: "Extra make arguments, space separated (e.g. KCFLAGS=-Wno-error)"
         type: string
         default: ""
+      extra_kcflags:
+        description: "Extra compiler flags appended to KCFLAGS (e.g. -Wno-error)"
+        type: string
+        default: ""
       stock_boot_url:
         description: "URL of the stock boot.img (only used if stock/boot.img is not in the repo)"
         type: string
@@ -54,6 +58,7 @@ jobs:
       DEFCONFIG: ${{ inputs.defconfig || 'gts6lwifi_eur_open_defconfig' }}
       EXTRA_CONFIG: ${{ inputs.extra_config }}
       EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
+      EXTRA_KCFLAGS: ${{ inputs.extra_kcflags }}
       STOCK_BOOT_URL: ${{ inputs.stock_boot_url || vars.STOCK_BOOT_URL }}
       RAMDISK_URL: ${{ inputs.ramdisk_url || vars.RAMDISK_URL }}
 
@@ -114,6 +119,10 @@ jobs:
             CROSS_COMPILE=aarch64-linux-android-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             CONFIG_BUILD_ARM64_DT_OVERLAY=y
+            # Samsung code (e.g. security/samsung/five) includes "security/integrity/integrity.h",
+            # which needs the source root on the include path; with O=out the relative
+            # root gets mangled by kbuild, so pass it as an absolute path.
+            KCFLAGS="-I$PWD ${EXTRA_KCFLAGS:-}"
           )
           # Samsung ships a prebuilt dtc in tools/ and builds with DTC_EXT
           if [ -f tools/dtc ]; then
@@ -132,7 +141,8 @@ jobs:
             make "${make_args[@]}" olddefconfig
           fi
 
-          make "${make_args[@]}" 2>&1 | tee build.log
+          # -k: keep compiling after a failure so a single run lists every broken file
+          make -k "${make_args[@]}" 2>&1 | tee build.log
 
           # ---- collect outputs ----
           B=out/arch/arm64/boot
@@ -150,6 +160,17 @@ jobs:
               || echo "::warning::modules_install failed (continuing)"
           fi
           ls -lh dist dist/dtbs
+
+      - name: Summarize build errors
+        if: failure()
+        run: |
+          [ -f build.log ] || exit 0
+          {
+            echo '### Build errors'
+            echo '```'
+            grep -nE 'error:|\*\*\* \[|undefined reference|Error [0-9]+$' build.log | head -n 60 || true
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Locate stock boot.img
         id: stock
