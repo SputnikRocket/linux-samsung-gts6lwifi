@@ -19,16 +19,31 @@ on:
         description: "Extra compiler flags appended to KCFLAGS (e.g. -Wno-error)"
         type: string
         default: ""
-      stock_boot_url:
-        description: "URL of the stock boot.img (wins over stock/boot.img in the repo)"
+      dtb_names:
+        description: "Base device trees to append to the kernel image (paths under arch/arm64/boot/dts, without .dtb). Default = the four in the stock T860XXS5DWH1 kernel, in the same order; the bootloader needs them."
+        type: string
+        default: "qcom/sm8150p qcom/sm8150-v2 qcom/sm8150p-v2 qcom/sm8150"
+      boot_mode:
+        description: "from-scratch: assemble boot.img here (header values from the BOOT_* env below, no stock image needed). repack-stock: unpack a stock boot.img and swap the kernel in."
+        type: choice
+        options:
+          - from-scratch
+          - repack-stock
+        default: from-scratch
+      boot_cmdline:
+        description: "Kernel command line for boot.img (from-scratch mode). Empty = the stock Android one. The Magisk image always gets the stock one."
         type: string
         default: ""
       ramdisk_url:
-        description: "Optional replacement ramdisk/initramfs URL (cpio, gz, lz4, xz...). Empty = keep the stock ramdisk"
+        description: "Optional ramdisk/initramfs URL (cpio, gz, lz4, xz...), e.g. a postmarketOS initramfs. Empty = empty ramdisk in from-scratch mode, the stock ramdisk in repack-stock mode. The from-scratch Magisk image never uses it."
+        type: string
+        default: ""
+      stock_boot_url:
+        description: "repack-stock mode only: URL of the stock boot.img (wins over stock/boot.img in the repo)"
         type: string
         default: ""
       require_boot_img:
-        description: "Fail immediately if there is no usable stock boot.img. Untick to build only the kernel + modules."
+        description: "repack-stock mode only: fail immediately if there is no usable stock boot.img. Untick to build only the kernel + modules."
         type: boolean
         default: true
 
@@ -45,9 +60,33 @@ env:
   CLANG_VER: clang-r353983c
   CLANG_BRANCH: android10-release
   GCC_BRANCH: android10-release
-  MAGISK_VERSION: v27.0
+  MAGISK_VERSION: v31.1   # same release that patched this tablet's earlier boot image (its magiskinit is byte-identical)
+  # ---- boot.img header for from-scratch mode. Every value below was read from a real SM-T860 boot
+  # image (firmware T860XXS5DWH1, Android 12, Aug 2023 patch level). os_version / patch level matter:
+  # Android's keystore binds keys to them, so keep them equal to the firmware you run.
+  BOOT_HEADER_VERSION: "1"
+  BOOT_PAGESIZE: "4096"
+  BOOT_BASE: "0x00000000"
+  BOOT_KERNEL_OFFSET: "0x00008000"
+  BOOT_RAMDISK_OFFSET: "0x00000000"
+  BOOT_SECOND_OFFSET: "0x00000000"
+  BOOT_TAGS_OFFSET: "0x01e00000"
+  BOOT_BOARD: SRPSD11A005
+  BOOT_OS_VERSION: "12.0.0"
+  BOOT_OS_PATCH_LEVEL: "2023-08"
+  BOOT_CMDLINE: "console=null androidboot.hardware=qcom androidboot.console=ttyMSM0 androidboot.memcg=1 lpm_levels.sleep_disabled=1 video=vfb:640x400,bpp=32,memsize=3072000 msm_rtb.filter=0x237 service_locator.enable=1 swiotlb=2048 androidboot.usbcontroller=a600000.dwc3 firmware_class.path=/vendor/firmware_mnt/image loop.max_part=7"
+  BOOT_PARTITION_SIZE: "67108864"   # the boot partition is 64 MiB; the build fails if the image would not fit
+  BOOT_RAMDISK_COMPRESS: gzip       # gzip | none. This kernel can unpack gzip/bzip2/lzma initramfs, not xz/lz4/zstd
+  # Options for the Magisk-patched image, same meaning as in the Magisk app. KEEPVERITY,
+  # KEEPFORCEENCRYPT, RECOVERYMODE, LEGACYSAR (the kernel carries want_initramfs) and PREINITDEVICE
+  # are what the Magisk app recorded when it patched this tablet's own boot image earlier.
+  MAGISK_KEEPVERITY: "true"
+  MAGISK_KEEPFORCEENCRYPT: "true"
+  MAGISK_PATCHVBMETAFLAG: "false"
+  MAGISK_RECOVERYMODE: "false"
+  MAGISK_LEGACYSAR: "true"   # makes the kernel load the ramdisk (patches skip_initramfs -> want_initramfs)
+  MAGISK_PREINITDEVICE: "sda27"   # partition Magisk uses for pre-init data; cannot be detected off-device
   STOCK_BOOT_PATH: stock/boot.img
-  DTB_GLOB: "*gts6*.dtb"
 
 jobs:
   build:
@@ -58,6 +97,9 @@ jobs:
       EXTRA_CONFIG: ${{ inputs.extra_config }}
       EXTRA_MAKE_ARGS: ${{ inputs.extra_make_args }}
       EXTRA_KCFLAGS: ${{ inputs.extra_kcflags }}
+      DTB_NAMES: ${{ inputs.dtb_names }}
+      BOOT_MODE: ${{ inputs.boot_mode || 'from-scratch' }}
+      BOOT_CMDLINE_OVERRIDE: ${{ inputs.boot_cmdline }}
       STOCK_BOOT_URL: ${{ inputs.stock_boot_url || vars.STOCK_BOOT_URL }}
       RAMDISK_URL: ${{ inputs.ramdisk_url || vars.RAMDISK_URL }}
       REQUIRE_BOOT_IMG: ${{ inputs.require_boot_img }}
@@ -84,6 +126,7 @@ jobs:
       # image should fail in seconds, not after the build.
       - name: Locate stock boot.img
         id: stock
+        if: env.BOOT_MODE == 'repack-stock'
         run: |
           set -euo pipefail
           S="$RUNNER_TEMP/stock"; mkdir -p "$S"
@@ -205,7 +248,8 @@ jobs:
           aarch64-linux-android-gcc --version | head -n1
           python --version
 
-          # dist/kernel -> "kernel" artifact, dist/modules -> "modules", dist/boot -> "boot-img"
+          # dist/kernel -> "kernel" artifact, dist/modules -> "modules", dist/boot -> "boot-img",
+          # dist/boot-magisk -> "boot-magisk-img" (created by the Magisk step)
           mkdir -p dist/kernel dist/modules dist/boot
           LOG=dist/kernel/build.log
 
@@ -269,16 +313,43 @@ jobs:
           # ---- collect outputs ----
           B=out/arch/arm64/boot
           [ -f "$B/Image" ] || { echo "::error::build finished without producing $B/Image"; exit 1; }
-          # Image-dtb = Samsung's 'UNCOMPRESSED_IMG' header + Image (+ any appended DTBs).
-          # This tree builds no DTBs: the device tree comes from the dtbo partition.
+
+          # Append the base device trees. In this source drop `make dtbs` is a no-op (Samsung's
+          # dts/samsung/Makefile has empty branches), so Image-dtb comes out as just
+          # 'UNCOMPRESSED_IMG' + size + Image. The stock kernel has four SM8150/SM8150P base DTBs
+          # appended after the Image and the bootloader needs one, so build them with kbuild's own
+          # %.dtb rule and assemble Image-dtb the way arch/arm64/boot/Makefile does.
+          if [ -n "${DTB_NAMES:-}" ]; then
+            read -r -a dtb_names <<<"$DTB_NAMES"
+            make "${make_args[@]}" "${dtb_names[@]/%/.dtb}"
+            python3 - "$B" "${dtb_names[@]}" <<'PY'
+          import os, struct, sys
+          boot, names = sys.argv[1], sys.argv[2:]
+          img = open(f"{boot}/Image", "rb").read()
+          hdr = b"UNCOMPRESSED_IMG" + struct.pack("<I", len(img))
+          dtbs = []
+          for n in names:
+              d = open(f"{boot}/dts/{n}.dtb", "rb").read()
+              assert d[:4] == bytes.fromhex("d00dfeed"), f"{n}.dtb is not a flattened device tree"
+              dtbs.append(d)
+          path = f"{boot}/Image-dtb"
+          if os.path.exists(path):
+              old = open(path, "rb").read()
+              # our header layout must match what kbuild itself produced
+              assert old[:len(hdr) + len(img)] == hdr + img, "kbuild's Image-dtb does not start with header+Image as assumed"
+          open(path, "wb").write(hdr + img + b"".join(dtbs))
+          print(f"Image-dtb: header+Image = {len(hdr) + len(img)} bytes, appended {len(dtbs)} DTBs = {sum(map(len, dtbs))} bytes")
+          PY
+          else
+            echo "::warning::dtb_names is empty: Image-dtb has no appended device tree, so the bootloader will most likely refuse it"
+          fi
+
           for f in Image Image.gz Image.gz-dtb Image-dtb; do
             if [ -f "$B/$f" ]; then cp "$B/$f" dist/kernel/; fi
           done
           mapfile -t built_dt < <(find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) 2>/dev/null)
           if [ "${#built_dt[@]}" -gt 0 ]; then
             mkdir -p dist/kernel/dtbs && cp -t dist/kernel/dtbs "${built_dt[@]}"
-          else
-            echo "No .dtb/.dtbo files were built (expected for this tree)."
           fi
           cp out/.config dist/kernel/config
           make "${make_args[@]}" -s kernelrelease 2>/dev/null | tail -n1 > dist/kernel/kernelrelease.txt || true
@@ -319,58 +390,201 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # magiskboot (runs on the runner) unpacks/repacks the image; the other binaries are what the
+      # Magisk patch puts into the ramdisk, so they are the arm64 builds, not x86. The APK layout
+      # changed over time (v27: magisk64 + magisk32 + stub.apk; v28 and later: magisk + init-ld), so
+      # whatever the pinned release has is extracted and boot_patch.sh uses what it needs.
+      - name: Fetch Magisk
+        if: env.BOOT_MODE == 'from-scratch' || steps.stock.outputs.path != ''
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/magisk"; APK="$RUNNER_TEMP/magisk-release.apk"; rm -rf "$M"; mkdir -p "$M"
+          curl -fL --retry 3 -o "$APK" \
+            "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VERSION}/Magisk-${MAGISK_VERSION}.apk"
+          x()  { unzip -p "$APK" "$1" > "$M/$2" 2>/dev/null && [ -s "$M/$2" ] || { echo "::error::$1 is missing from Magisk $MAGISK_VERSION"; exit 1; }; }
+          xo() { unzip -p "$APK" "$1" > "$M/$2" 2>/dev/null && [ -s "$M/$2" ] || rm -f "$M/$2"; }
+          x  lib/x86_64/libmagiskboot.so    magiskboot
+          x  lib/arm64-v8a/libmagiskinit.so magiskinit
+          x  assets/boot_patch.sh           boot_patch.sh
+          xo lib/arm64-v8a/libmagisk.so     magisk
+          xo lib/arm64-v8a/libinit-ld.so    init-ld
+          xo lib/arm64-v8a/libmagisk64.so   magisk64
+          xo lib/armeabi-v7a/libmagisk32.so magisk32
+          xo assets/stub.apk                stub.apk
+          [ -f "$M/magisk" ] || [ -f "$M/magisk64" ] || { echo "::error::no magisk binary found in Magisk $MAGISK_VERSION"; exit 1; }
+          chmod +x "$M"/*
+          "$M/magiskboot" --help 2>&1 | head -n 1 || true
+          ls -l "$M"
+
+      # From scratch: no stock image involved. The header is assembled here from the BOOT_* values
+      # (same layout as AOSP's mkbootimg for header v1) and Samsung's SEANDROIDENFORCE trailer goes
+      # on the end. Two images come out: boot.img (your cmdline / ramdisk if you set any) and an
+      # Android-style twin (stock cmdline, empty ramdisk) that the Magisk step patches.
+      - name: Build boot.img from scratch
+        if: env.BOOT_MODE == 'from-scratch'
+        run: |
+          set -euo pipefail
+          WORK="$RUNNER_TEMP/scratch"
+          B="$GITHUB_WORKSPACE/out/arch/arm64/boot"
+          MB="$RUNNER_TEMP/magisk/magiskboot"
+          rm -rf "$WORK"; mkdir -p "$WORK" dist/boot
+          [ -f "$B/Image-dtb" ] || { echo "::error::Image-dtb was not built"; exit 1; }
+
+          # Optional initramfs. The kernel here only unpacks gzip/bzip2/lzma, so anything else
+          # (lz4, zstd, xz...) is decompressed to a plain cpio first; the script then gzips it.
+          if [ -n "${RAMDISK_URL:-}" ]; then
+            curl -fL --retry 3 -o "$WORK/ramdisk.in" "$RAMDISK_URL"
+            if head -c 6 "$WORK/ramdisk.in" | grep -q '^07070[12]'; then
+              cp "$WORK/ramdisk.in" "$WORK/ramdisk.cpio"
+            else
+              "$MB" decompress "$WORK/ramdisk.in" "$WORK/ramdisk.cpio"
+            fi
+            head -c 6 "$WORK/ramdisk.cpio" | grep -q '^07070[12]' \
+              || { echo "::error::ramdisk_url did not give a cpio archive"; exit 1; }
+          fi
+
+          python3 - "$B/Image-dtb" "$WORK" "$GITHUB_WORKSPACE/dist" <<'PY'
+          import gzip, hashlib, os, struct, sys
+          kernel_path, work, dist = sys.argv[1:4]
+          e = os.environ
+          def need(ok, msg):                                  # fail with a GitHub error annotation, not a traceback
+              if not ok:
+                  print("::error title=boot.img::" + msg); sys.exit(1)
+          num = lambda k: int(e[k], 0)
+          page, base, ver = num("BOOT_PAGESIZE"), num("BOOT_BASE"), num("BOOT_HEADER_VERSION")
+          need(ver == 1, "only boot image header v1 is implemented")
+          pad = lambda b: b + b"\0" * (-len(b) % page)
+
+          y, m = e["BOOT_OS_PATCH_LEVEL"].split("-")
+          a, b, c = (int(x) for x in e["BOOT_OS_VERSION"].split("."))
+          os_word = ((a << 14 | b << 7 | c) << 11) | ((int(y) - 2000) << 4 | int(m))
+
+          kernel = open(kernel_path, "rb").read()
+          need(kernel.startswith(b"UNCOMPRESSED_IMG"), "kernel is not Samsung's Image-dtb")
+          need(kernel[20 + struct.unpack("<I", kernel[16:20])[0]:][:4] == bytes.fromhex("d00dfeed"),
+               "Image-dtb has no appended device tree (check dtb_names)")
+
+          def newc(entries):                                  # minimal cpio "newc" writer
+              out = b""
+              for i, (name, data) in enumerate(entries, 1):
+                  nz = name.encode() + b"\0"
+                  ino = i if name != "TRAILER!!!" else 0
+                  f = [ino, 0o100644 if data else 0, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(nz), 0]
+                  out += (b"070701" + b"".join(b"%08X" % v for v in f) + nz).ljust(-(-(110 + len(nz)) // 4) * 4, b"\0")
+                  out += data.ljust(-(-len(data) // 4) * 4, b"\0")
+              return out
+          empty_cpio = newc([("TRAILER!!!", b"")])
+
+          def image(ramdisk, cmdline):
+              cmd = cmdline.encode()
+              need(len(cmd) < 512, "kernel command line must be shorter than 512 bytes (it is %d)" % len(cmd))
+              sha = hashlib.sha1()                            # header 'id': kernel, ramdisk, second, recovery_dtbo
+              for blob in (kernel, ramdisk, b""):
+                  sha.update(blob); sha.update(struct.pack("<I", len(blob)))
+              sha.update(struct.pack("<I", 0))
+              h = b"ANDROID!" + struct.pack(
+                  "<10I", len(kernel), base + num("BOOT_KERNEL_OFFSET"), len(ramdisk), base + num("BOOT_RAMDISK_OFFSET"),
+                  0, base + num("BOOT_SECOND_OFFSET"), base + num("BOOT_TAGS_OFFSET"), page, ver, os_word)
+              h += e["BOOT_BOARD"].encode().ljust(16, b"\0") + cmd.ljust(512, b"\0") + sha.digest().ljust(32, b"\0") + b"\0" * 1024
+              h += struct.pack("<IQI", 0, 0, 1648)            # recovery_dtbo size / offset, header size
+              assert len(h) == 1648
+              out = pad(pad(h) + pad(kernel) + pad(ramdisk) + b"SEANDROIDENFORCE")
+              need(len(out) <= num("BOOT_PARTITION_SIZE"), "image is %d bytes, larger than the %d byte boot partition (ramdisk too big?)" % (len(out), num("BOOT_PARTITION_SIZE")))
+              return out
+
+          user_cpio = open(f"{work}/ramdisk.cpio", "rb").read() if os.path.exists(f"{work}/ramdisk.cpio") else None
+          if user_cpio is None:
+              ramdisk = empty_cpio
+          elif e["BOOT_RAMDISK_COMPRESS"] == "gzip":
+              ramdisk = gzip.compress(user_cpio, 9, mtime=0)
+          else:
+              ramdisk = user_cpio
+          cmdline = e.get("BOOT_CMDLINE_OVERRIDE", "").strip() or e["BOOT_CMDLINE"]
+          android_cmdline = e["BOOT_CMDLINE"]
+
+          def expected(cmd):                                  # what `magiskboot unpack -h` should print back
+              return "name=%s\ncmdline=%s\nos_version=%s\nos_patch_level=%s\n" % (
+                  e["BOOT_BOARD"], cmd, e["BOOT_OS_VERSION"], e["BOOT_OS_PATCH_LEVEL"])
+          for path, rd, cmd, exp in ((f"{dist}/boot/boot.img", ramdisk, cmdline, "boot.expected"),
+                                     (f"{dist}/magisk-input.img", empty_cpio, android_cmdline, "android.expected")):
+              data = image(rd, cmd)                           # build first: a failed check must not leave a half-written file
+              open(path, "wb").write(data)
+              open(f"{work}/{exp}", "w").write(expected(cmd))
+              print("wrote %s: %d bytes (ramdisk %d bytes)" % (os.path.basename(path), len(data), len(rd)))
+          PY
+
+          # Read both images back with magiskboot, a parser that is not ours, and check them.
+          for pair in "boot/boot.img:boot.expected" "magisk-input.img:android.expected"; do
+            img="dist/${pair%%:*}"; exp="$WORK/${pair##*:}"; d="$WORK/check-$(basename "$img" .img)"
+            mkdir -p "$d"; (cd "$d" && "$MB" unpack -h "$GITHUB_WORKSPACE/$img" >/dev/null)
+            diff "$exp" "$d/header" || { echo "::error::$img: header read back differently from what was written"; exit 1; }
+            if [ -f "$d/kernel_dtb" ]; then cat "$d/kernel" "$d/kernel_dtb" > "$d/k.bin"; else cp "$d/kernel" "$d/k.bin"; fi
+            cmp "$d/k.bin" "$B/Image-dtb" || { echo "::error::$img: kernel does not match Image-dtb"; exit 1; }
+            echo "$img: header, kernel and $([ -f "$d/kernel_dtb" ] && stat -c %s "$d/kernel_dtb" || echo 0) bytes of appended DTBs read back OK"
+          done
+          cd dist/boot
+          ls -l boot.img
+          sha256sum boot.img | tee boot.img.sha256
+
       - name: Repack boot.img
-        if: steps.stock.outputs.path != ''
+        if: env.BOOT_MODE == 'repack-stock' && steps.stock.outputs.path != ''
         env:
           STOCK: ${{ steps.stock.outputs.path }}
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/bootimg"
           B="$GITHUB_WORKSPACE/out/arch/arm64/boot"
+          MB="$RUNNER_TEMP/magisk/magiskboot"
           rm -rf "$WORK"; mkdir -p "$WORK/unpacked" "$GITHUB_WORKSPACE/dist/boot"
-
-          # magiskboot: static x86_64 binary shipped inside the Magisk APK
-          curl -fL --retry 3 -o "$WORK/magisk.apk" \
-            "https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_VERSION}/Magisk-${MAGISK_VERSION}.apk"
-          unzip -p "$WORK/magisk.apk" lib/x86_64/libmagiskboot.so > "$WORK/magiskboot"
-          chmod +x "$WORK/magiskboot"
-          MB="$WORK/magiskboot"
 
           cd "$WORK/unpacked"
           "$MB" unpack -h "$STOCK" 2>&1 | tee ../unpack.log
           echo "--- stock components ---"; ls -l
 
           [ -f kernel ] || { echo "::error::no kernel component found in the stock boot.img"; exit 1; }
+          [ -f "$B/Image-dtb" ] || { echo "::error::Image-dtb was not built"; exit 1; }
 
-          # Samsung SM8150 kernels are shipped uncompressed behind a 'UNCOMPRESSED_IMG'
-          # header (the kernel build emits that as Image-dtb). If the stock image does that,
-          # the replacement must too; otherwise give magiskboot the raw Image and let it
-          # recompress to the original format.
-          if head -c 16 kernel | grep -qa '^UNCOMPRESSED_IMG'; then
-            echo "Stock kernel has the UNCOMPRESSED_IMG header -> using Image-dtb"
-            [ -f "$B/Image-dtb" ] || { echo "::error::Image-dtb was not built"; exit 1; }
-            cp "$B/Image-dtb" kernel
-          else
-            echo "Stock kernel is a plain/compressed Image -> using raw Image"
-            cp "$B/Image" kernel
-          fi
-
-          # Only relevant if the stock image carries its DTB separately (kernel_dtb / dtb).
-          # If this build produced none, keep the stock one rather than failing.
-          if [ -f kernel_dtb ] || [ -f dtb ]; then
-            mapfile -t dtbs < <(find "$B/dts" -name "$DTB_GLOB" 2>/dev/null | sort)
-            [ "${#dtbs[@]}" -gt 0 ] || mapfile -t dtbs < <(find "$B/dts" -name '*.dtb' 2>/dev/null | sort)
-            if [ "${#dtbs[@]}" -gt 0 ]; then
-              cat "${dtbs[@]}" > "$WORK/dtb.new"
-              [ "$(head -c 4 "$WORK/dtb.new" | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ] || { echo "::error::DTB blob has no FDT magic"; exit 1; }
-              if [ -f kernel_dtb ]; then cp "$WORK/dtb.new" kernel_dtb; fi
-              if [ -f dtb ]; then cp "$WORK/dtb.new" dtb; fi
-            else
-              echo "::warning::this build produced no DTBs; keeping the stock image's DTB"
-            fi
-          else
-            echo "Stock boot.img has no separate DTB component (the device tree comes from dtbo), nothing to replace."
-          fi
+          # Samsung SM8150 kernels are 'UNCOMPRESSED_IMG' + size + Image, followed by the base DTBs.
+          # magiskboot splits that into `kernel` (header + Image) and `kernel_dtb` (the DTBs) and
+          # joins them again on repack. Swap in the new Image and the new DTBs the same way.
+          python3 - "$B" <<'PY'
+          import os, struct, sys
+          B = sys.argv[1]
+          built = open(f"{B}/Image-dtb", "rb").read()      # header + Image + DTBs
+          n = struct.unpack("<I", built[16:20])[0]
+          b_main, b_tail = built[:20 + n], built[20 + n:]
+          assert b_tail == b"" or b_tail[:4] == bytes.fromhex("d00dfeed"), "bytes after the Image are not a DTB"
+          stock = open("kernel", "rb").read()
+          sep = os.path.exists("kernel_dtb")
+          kernel, kdtb = None, None
+          if stock.startswith(b"UNCOMPRESSED_IMG"):
+              k = struct.unpack("<I", stock[16:20])[0]
+              s_tail = stock[20 + k:]
+              if not s_tail and not sep:
+                  print("Stock kernel has no device tree appended; not adding one")
+                  kernel = b_main
+              elif not b_tail:
+                  print("::warning::this build appended no DTBs; keeping the stock ones (they may not match the new kernel)")
+                  kernel = b_main + s_tail
+              elif s_tail:                                    # magiskboot left them inside `kernel`
+                  kernel = b_main + b_tail
+              else:
+                  kernel, kdtb = b_main, b_tail
+              print("Stock kernel is UNCOMPRESSED_IMG: new Image %d bytes; DTBs: %s" % (
+                  len(b_main) - 20,
+                  "%d bytes as kernel_dtb" % len(kdtb) if kdtb else "%d bytes inline" % len(b_tail) if s_tail and b_tail
+                  else "stock ones kept" if s_tail or sep else "none"))
+          else:
+              print("Stock kernel is a plain/compressed Image -> using the raw Image (magiskboot recompresses it)")
+              kernel = open(f"{B}/Image", "rb").read()
+              if sep and b_tail:
+                  kdtb = b_tail
+          open("kernel", "wb").write(kernel)
+          if kdtb:
+              open("kernel_dtb", "wb").write(kdtb)
+          PY
+          echo "--- components after replacement ---"; ls -l kernel kernel_dtb 2>/dev/null || true
+          if [ -f dtb ]; then echo "::notice::stock image has a separate 'dtb' section (header v2); left untouched"; fi
 
           if [ -n "${RAMDISK_URL:-}" ]; then
             curl -fL --retry 3 -o "$WORK/ramdisk.in" "$RAMDISK_URL"
@@ -383,15 +597,91 @@ jobs:
 
           "$MB" repack "$STOCK" "$GITHUB_WORKSPACE/dist/boot/boot.img"
 
-          # sanity check: the result must unpack again
+          # sanity check: the result unpacks again with the same header (page size, board name,
+          # os version, cmdline) and the same set of components as the stock image
           mkdir -p "$WORK/verify"; cd "$WORK/verify"
-          "$MB" unpack "$GITHUB_WORKSPACE/dist/boot/boot.img" >/dev/null
+          "$MB" unpack -h "$GITHUB_WORKSPACE/dist/boot/boot.img" >/dev/null
+          diff "$WORK/unpacked/header" header && echo "header unchanged"
           ls -l
           cd "$GITHUB_WORKSPACE/dist/boot"
           ls -l "$STOCK" boot.img
           sha256sum boot.img | tee boot.img.sha256
+          cp boot.img ../magisk-input.img
 
-      # Three separate artifacts: kernel (Image/config/log), modules, boot.img
+      # Magisk's own patcher (boot_patch.sh from the APK, the same script the Magisk app runs) on
+      # the freshly repacked image. SOURCEDMODE skips its on-device setup; it only needs the three
+      # helper functions below and the binaries Fetch Magisk put next to it.
+      - name: Patch boot.img with Magisk
+        if: hashFiles('dist/magisk-input.img') != ''
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/magisk"; P="$RUNNER_TEMP/magisk-patch"
+          OUT="$GITHUB_WORKSPACE/dist/boot-magisk"
+          rm -rf "$P"; mkdir -p "$P" "$OUT"
+          cp "$M"/* "$P/"
+          cp dist/magisk-input.img "$P/boot.img"
+          cd "$P"
+          mkdir input && (cd input && ../magiskboot unpack -h ../boot.img >/dev/null)   # reference header
+
+          for v in KEEPVERITY KEEPFORCEENCRYPT PATCHVBMETAFLAG RECOVERYMODE LEGACYSAR; do
+            val="MAGISK_$v"; val="${!val}"
+            case "$val" in true|false) ;; *) echo "::error::MAGISK_$v must be true or false, got '$val'"; exit 1 ;; esac
+          done
+
+          cat > run.sh <<'EOF'
+          ui_print() { echo "$1"; }
+          abort() { echo "$1" >&2; exit 1; }
+          grep_prop() { local r="s/^$1=//p"; shift; cat "$@" 2>/dev/null | sed -n "$r" | head -n 1; }
+          export SOURCEDMODE=true BOOTMODE=false
+          export KEEPVERITY="$MAGISK_KEEPVERITY" KEEPFORCEENCRYPT="$MAGISK_KEEPFORCEENCRYPT"
+          export PATCHVBMETAFLAG="$MAGISK_PATCHVBMETAFLAG" RECOVERYMODE="$MAGISK_RECOVERYMODE"
+          LEGACYSAR="$MAGISK_LEGACYSAR"; PREINITDEVICE="${MAGISK_PREINITDEVICE:-}"
+          . ./boot_patch.sh "$1"
+          EOF
+          echo "Magisk $MAGISK_VERSION: KEEPVERITY=$MAGISK_KEEPVERITY KEEPFORCEENCRYPT=$MAGISK_KEEPFORCEENCRYPT PATCHVBMETAFLAG=$MAGISK_PATCHVBMETAFLAG RECOVERYMODE=$MAGISK_RECOVERYMODE LEGACYSAR=$MAGISK_LEGACYSAR PREINITDEVICE=${MAGISK_PREINITDEVICE:-<none>}"
+
+          set +e
+          bash run.sh boot.img 2>&1 | tee patch.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -eq 0 ] && [ -s new-boot.img ] || { echo "::error::Magisk's boot_patch.sh failed (exit $rc)"; exit 1; }
+
+          # --- what did the patch actually do? ---
+          MB="$P/magiskboot"
+          mkdir -p verify; cd verify
+          "$MB" unpack -h ../new-boot.img >/dev/null
+          diff ../input/header header >/dev/null && echo "header unchanged" \
+            || { echo "::error::boot image header changed during the Magisk patch"; exit 1; }
+          set +e; "$MB" cpio ramdisk.cpio test; st=$?; set -e
+          [ $((st & 3)) -eq 1 ] || { echo "::error::ramdisk is not recognised as Magisk-patched (test=$st)"; exit 1; }
+          for f in init .backup/.magisk; do
+            "$MB" cpio ramdisk.cpio "exists $f" || { echo "::error::ramdisk is missing $f"; exit 1; }
+          done
+          # the magisk payload is overlay.d/sbin/magisk.xz (v28+) or magisk64.xz (v27 and earlier)
+          "$MB" cpio ramdisk.cpio "exists overlay.d/sbin/magisk.xz" || "$MB" cpio ramdisk.cpio "exists overlay.d/sbin/magisk64.xz" \
+            || { echo "::error::ramdisk has no Magisk binary under overlay.d/sbin"; exit 1; }
+          echo "--- ramdisk ---"; "$MB" cpio ramdisk.cpio "ls -r" | head -n 40
+          cd ..
+
+          # Magisk's kernel patches (RKP / defex / skip_initramfs) match byte patterns of specific
+          # Samsung kernels. Report which ones applied to this build.
+          echo "--- kernel patches reported by magiskboot ---"
+          grep -E 'Patch @' patch.log || echo "(none)"
+          hit() { grep -qiE "Patch @.*$1" patch.log; }
+          if grep -q '^CONFIG_SECURITY_DEFEX=y' "$GITHUB_WORKSPACE/out/.config" 2>/dev/null && ! hit '821b8012'; then
+            echo "::warning title=Magisk's defex patch did not match this kernel::CONFIG_SECURITY_DEFEX=y and Magisk's defex byte patch found nothing to patch. Magisk applied that patch to the stock T860XXS5DWH1 kernel, so Samsung's DEFEX will probably block su here. Rebuild with CONFIG_SECURITY_DEFEX=n added to extra_config."
+          fi
+          if [ "$MAGISK_LEGACYSAR" = true ] && ! hit '736b69705f696e697472616d667300'; then
+            echo "::warning title=skip_initramfs patch not applied::MAGISK_LEGACYSAR is true but this kernel has no skip_initramfs string to patch, so the image will boot like the unpatched one. Set MAGISK_LEGACYSAR to false in the workflow env if this is not a legacy system-as-root device."
+          fi
+
+          cp new-boot.img "$OUT/boot-magisk.img"
+          cp patch.log "$OUT/magisk-patch.log"
+          cd "$OUT"
+          ls -l "$GITHUB_WORKSPACE/dist/magisk-input.img" boot-magisk.img
+          sha256sum boot-magisk.img | tee boot-magisk.img.sha256
+
+      # Four separate artifacts: kernel (Image/config/log), modules, boot.img, Magisk-patched boot.img
       - name: Upload kernel artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -416,4 +706,12 @@ jobs:
         with:
           name: gts6lwifi-boot-img-${{ github.run_number }}
           path: dist/boot/
+          retention-days: 30
+
+      - name: Upload Magisk-patched boot.img artifact
+        if: always() && hashFiles('dist/boot-magisk/boot-magisk.img') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gts6lwifi-boot-magisk-img-${{ github.run_number }}
+          path: dist/boot-magisk/
           retention-days: 30
