@@ -7,10 +7,14 @@ on:
         description: "Defconfig name from arch/arm64/configs"
         type: string
         default: gts6lwifi_eur_open_defconfig
-      extra_config:
-        description: "Kconfig overrides, space separated. Default turns off Samsung's CFP (needs Qualcomm's private clang; crashes with AOSP clang). Clear it to build the defconfig untouched."
+      config_fragment:
+        description: "Config fragment(s) from arch/arm64/configs merged on top of the defconfig, space separated. The default turns off Samsung's CFP (needs Qualcomm's private clang; crashes with AOSP clang) and sets LOCALVERSION. Clear it to build the defconfig untouched."
         type: string
-        default: "CONFIG_RKP_CFP=n CONFIG_RKP_CFP_JOPP=n CONFIG_RKP_CFP_ROPP=n"
+        default: gts6lwifi_custom.config
+      extra_config:
+        description: "Extra Kconfig overrides applied last, space separated (e.g. CONFIG_FOO=y CONFIG_BAR=n)"
+        type: string
+        default: ""
       dtb_names:
         description: "Base device trees to append to the kernel image (paths under arch/arm64/boot/dts, without .dtb). Default = the four in the stock T860XXS5DWH1 kernel, in the same order; the bootloader needs them."
         type: string
@@ -51,6 +55,7 @@ jobs:
     timeout-minutes: 120
     env:
       DEFCONFIG: ${{ inputs.defconfig || 'gts6lwifi_eur_open_defconfig' }}
+      CONFIG_FRAGMENT: ${{ inputs.config_fragment }}
       EXTRA_CONFIG: ${{ inputs.extra_config }}
       DTB_NAMES: ${{ inputs.dtb_names }}
 
@@ -144,6 +149,9 @@ jobs:
             # which needs the source root on the include path; with O=out the relative
             # root gets mangled by kbuild, so pass it as an absolute path.
             KCFLAGS="-I$PWD"
+            # Empty LOCALVERSION stops scripts/setlocalversion from appending "+" (untagged git
+            # tree), so the release is exactly 4.14.190$CONFIG_LOCALVERSION.
+            LOCALVERSION=
           )
           # Samsung ships a prebuilt dtc in tools/ and builds with DTC_EXT
           if [ -f tools/dtc ]; then
@@ -153,6 +161,12 @@ jobs:
 
           make "${make_args[@]}" "$DEFCONFIG"
 
+          # kbuild's %.config rule: merge_config.sh merges arch/arm64/configs/<name> into .config
+          for frag in ${CONFIG_FRAGMENT:-}; do
+            [ -f "arch/arm64/configs/$frag" ] || { echo "::error::config fragment arch/arm64/configs/$frag not found"; exit 1; }
+            make "${make_args[@]}" "$frag"
+          done
+
           if [ -n "${EXTRA_CONFIG:-}" ]; then
             tr ' ' '\n' <<<"$EXTRA_CONFIG" >> out/.config
             make "${make_args[@]}" olddefconfig
@@ -160,7 +174,7 @@ jobs:
 
           # Exact names of Samsung's RKP / hypervisor / DEFEX options, for use with extra_config
           echo "::group::Samsung security-related config symbols"
-          grep -E 'RKP|CFP|_UH[_=]|KDP|DEFEX|APPENDED_DTB' out/.config | grep -v '^#' | sort || true
+          grep -E 'RKP|CFP|_UH[_=]|KDP|DEFEX|APPENDED_DTB|^CONFIG_LOCALVERSION=' out/.config | grep -v '^#' | sort || true
           echo "::endgroup::"
 
           # -k: keep compiling after a failure so a single run lists every broken file
@@ -174,7 +188,7 @@ jobs:
           # Samsung's post-link helper scripts (python) can crash without failing make
           # (their worker processes die on their own), leaving a half-processed vmlinux.
           if grep -qE '^Traceback \(most recent call last\)' "$LOG"; then
-            echo "::error title=Build helper script crashed::make exited 0 but build.log contains a Python traceback, so the kernel is not trustworthy. If it is RKP_CFP (scripts/rkp_cfp/instrument.py), set CONFIG_RKP_CFP=n CONFIG_RKP_CFP_JOPP=n CONFIG_RKP_CFP_ROPP=n in extra_config."
+            echo "::error title=Build helper script crashed::make exited 0 but build.log contains a Python traceback, so the kernel is not trustworthy. If it is RKP_CFP (scripts/rkp_cfp/instrument.py), make sure CONFIG_RKP_CFP, CONFIG_RKP_CFP_JOPP and CONFIG_RKP_CFP_ROPP are off (gts6lwifi_custom.config does this)."
             exit 1
           fi
 
