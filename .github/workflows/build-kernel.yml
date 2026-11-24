@@ -8,11 +8,11 @@ on:
         type: string
         default: gts6lwifi_eur_open_defconfig
       extra_config:
-        description: "Extra Kconfig options, space separated (e.g. CONFIG_SECURITY_DEFEX=n CONFIG_FOO=y)"
+        description: "Extra Kconfig options, space separated (e.g. CONFIG_RKP_CFP=n CONFIG_SECURITY_DEFEX=n)"
         type: string
         default: ""
       extra_make_args:
-        description: "Extra make arguments, space separated (e.g. KCFLAGS=-Wno-error)"
+        description: "Extra make arguments, space separated"
         type: string
         default: ""
       extra_kcflags:
@@ -27,11 +27,6 @@ on:
         description: "Optional replacement ramdisk/initramfs URL (cpio, gz, lz4, xz...). Empty = keep the stock ramdisk"
         type: string
         default: ""
-  push:
-    branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "Documentation/**"
 
 permissions:
   contents: read
@@ -128,6 +123,10 @@ jobs:
           aarch64-linux-android-gcc --version | head -n1
           python --version
 
+          # dist/kernel -> "kernel" artifact, dist/modules -> "modules", dist/boot -> "boot-img"
+          mkdir -p dist/kernel/dtbs dist/modules dist/boot
+          LOG=dist/kernel/build.log
+
           if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
             echo "::error::arch/arm64/configs/$DEFCONFIG not found. Closest matches:"
             ls arch/arm64/configs | grep -i -e gts6 -e t860 -e sm8150 || true
@@ -172,7 +171,7 @@ jobs:
 
           # -k: keep compiling after a failure so a single run lists every broken file
           set +e
-          make -k "${make_args[@]}" 2>&1 | tee build.log
+          make -k "${make_args[@]}" 2>&1 | tee "$LOG"
           rc=${PIPESTATUS[0]}
           set -e
           ccache -s | head -n 12 || true
@@ -181,19 +180,37 @@ jobs:
           # ---- collect outputs ----
           B=out/arch/arm64/boot
           [ -f "$B/Image" ] || { echo "::error::build finished without producing $B/Image"; exit 1; }
-          mkdir -p dist/dtbs
-          for f in Image Image.gz Image.gz-dtb Image-dtb; do
-            if [ -f "$B/$f" ]; then cp "$B/$f" dist/; fi
-          done
-          find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp -t dist/dtbs {} +
-          cp out/.config dist/config
-          make "${make_args[@]}" -s kernelrelease 2>/dev/null | tail -n1 > dist/kernelrelease.txt || true
 
-          if grep -q '^CONFIG_MODULES=y' out/.config; then
-            make "${make_args[@]}" INSTALL_MOD_PATH="$PWD/dist/modules" INSTALL_MOD_STRIP=1 modules_install \
-              || echo "::warning::modules_install failed (continuing)"
+          # Samsung's default target doesn't build the DTBs (the appended-DTB list in the
+          # defconfig is empty), so build them explicitly if none exist yet.
+          ndtb=$(find "$B/dts" -name '*.dtb' 2>/dev/null | wc -l)
+          if [ "$ndtb" -eq 0 ]; then
+            echo "::group::make dtbs"
+            make -k "${make_args[@]}" dtbs 2>&1 | tee -a "$LOG" || echo "::warning::dtbs target failed"
+            echo "::endgroup::"
           fi
-          ls -lh dist dist/dtbs
+
+          for f in Image Image.gz Image.gz-dtb Image-dtb; do
+            if [ -f "$B/$f" ]; then cp "$B/$f" dist/kernel/; fi
+          done
+          find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp -t dist/kernel/dtbs {} + || true
+          cp out/.config dist/kernel/config
+          make "${make_args[@]}" -s kernelrelease 2>/dev/null | tail -n1 > dist/kernel/kernelrelease.txt || true
+
+          # Modules: install into a staging dir, drop the build/ and source/ symlinks that
+          # point back into the source tree (artifact upload would follow them and pack
+          # the whole repo), then ship one tarball.
+          if grep -q '^CONFIG_MODULES=y' out/.config; then
+            stage="$RUNNER_TEMP/modules-root"; rm -rf "$stage"
+            if make "${make_args[@]}" INSTALL_MOD_PATH="$stage" INSTALL_MOD_STRIP=1 modules_install; then
+              find "$stage" -maxdepth 4 -type l \( -name build -o -name source \) -delete
+              rel="$(tr -d '\n' < dist/kernel/kernelrelease.txt)"
+              tar -C "$stage" -czf "dist/modules/modules-${rel:-unknown}.tar.gz" lib
+            else
+              echo "::warning::modules_install failed (continuing)"
+            fi
+          fi
+          ls -lh dist/kernel dist/kernel/dtbs dist/modules
 
       - name: Save ccache
         if: always()
@@ -205,13 +222,13 @@ jobs:
       - name: Summarize build errors
         if: failure()
         run: |
-          [ -f build.log ] || exit 0
+          [ -f dist/kernel/build.log ] || exit 0
           {
             echo '### Build errors'
             echo '```'
             # SyntaxError/Traceback catch script failures (e.g. Samsung's Python helpers);
             # -B3 shows the lines leading up to each hit.
-            grep -nE -B3 'SyntaxError|Traceback|error:|\*\*\* \[|undefined reference' build.log \
+            grep -nE -B3 'SyntaxError|Traceback|error:|\*\*\* \[|undefined reference' dist/kernel/build.log \
               | grep -vE 'ambiguous argument|to separate paths from revisions' | head -n 80 || true
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
@@ -242,7 +259,7 @@ jobs:
           set -euo pipefail
           WORK="$RUNNER_TEMP/bootimg"
           B="$GITHUB_WORKSPACE/out/arch/arm64/boot"
-          rm -rf "$WORK"; mkdir -p "$WORK/unpacked" "$GITHUB_WORKSPACE/dist"
+          rm -rf "$WORK"; mkdir -p "$WORK/unpacked" "$GITHUB_WORKSPACE/dist/boot"
 
           # magiskboot: static x86_64 binary shipped inside the Magisk APK
           curl -fL --retry 3 -o "$WORK/magisk.apk" \
@@ -251,29 +268,35 @@ jobs:
           chmod +x "$WORK/magiskboot"
           MB="$WORK/magiskboot"
 
-          # DTBs exactly as the kernel build would append them, if it did; else glob the dts output
+          # All built DTBs for this device, concatenated (the bootloader picks by board-id/rev)
           dtb_blob() {
-            if [ -f "$B/Image.gz-dtb" ]; then
-              tail -c +$(( $(stat -c %s "$B/Image.gz") + 1 )) "$B/Image.gz-dtb"
-            elif [ -f "$B/Image-dtb" ]; then
-              tail -c +$(( $(stat -c %s "$B/Image") + 1 )) "$B/Image-dtb"
-            else
-              mapfile -t files < <(find "$B/dts" -name "$DTB_GLOB" | sort)
-              if [ "${#files[@]}" -eq 0 ]; then
-                echo "::warning::no DTB matched $DTB_GLOB, using every .dtb" >&2
-                mapfile -t files < <(find "$B/dts" -name '*.dtb' | sort)
-              fi
-              cat "${files[@]}"
+            mapfile -t files < <(find "$B/dts" -name "$DTB_GLOB" | sort)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::warning::no DTB matched $DTB_GLOB, using every .dtb" >&2
+              mapfile -t files < <(find "$B/dts" -name '*.dtb' | sort)
             fi
+            [ "${#files[@]}" -gt 0 ] || { echo "::error::no .dtb files were built" >&2; return 1; }
+            cat "${files[@]}"
           }
 
           cd "$WORK/unpacked"
           "$MB" unpack -h "$STOCK" 2>&1 | tee ../unpack.log
           echo "--- stock components ---"; ls -l
 
-          # magiskboot hands us a decompressed kernel and recompresses it
-          # in the original format on repack, so always give it the raw Image.
-          cp "$B/Image" kernel
+          [ -f kernel ] || { echo "::error::no kernel component found in the stock boot.img"; exit 1; }
+
+          # Qualcomm SM8150 kernels can be shipped uncompressed behind a 'UNCOMPRESSED_IMG'
+          # header (the kernel build emits that as Image-dtb). If the stock image does that,
+          # the replacement must too; otherwise give magiskboot the raw Image and let it
+          # recompress to the original format.
+          if head -c 16 kernel | grep -qa '^UNCOMPRESSED_IMG'; then
+            echo "Stock kernel has the UNCOMPRESSED_IMG header -> using Image-dtb"
+            [ -f "$B/Image-dtb" ] || { echo "::error::Image-dtb was not built"; exit 1; }
+            cp "$B/Image-dtb" kernel
+          else
+            echo "Stock kernel is a plain/compressed Image -> using raw Image"
+            cp "$B/Image" kernel
+          fi
 
           if [ -f kernel_dtb ] || [ -f dtb ]; then
             dtb_blob > "$WORK/dtb.new"
@@ -282,7 +305,7 @@ jobs:
             if [ -f kernel_dtb ]; then cp "$WORK/dtb.new" kernel_dtb; fi
             if [ -f dtb ]; then cp "$WORK/dtb.new" dtb; fi
           else
-            echo "::warning::stock boot.img exposes no DTB component; only the kernel was replaced"
+            echo "::warning::stock boot.img has no separate DTB component; DTBs (if any) stay inside the kernel image"
           fi
 
           if [ -n "${RAMDISK_URL:-}" ]; then
@@ -294,23 +317,41 @@ jobs:
             fi
           fi
 
-          "$MB" repack "$STOCK" "$GITHUB_WORKSPACE/dist/boot.img"
+          "$MB" repack "$STOCK" "$GITHUB_WORKSPACE/dist/boot/boot.img"
 
           # sanity check: the result must unpack again
           mkdir -p "$WORK/verify"; cd "$WORK/verify"
-          "$MB" unpack "$GITHUB_WORKSPACE/dist/boot.img" >/dev/null
+          "$MB" unpack "$GITHUB_WORKSPACE/dist/boot/boot.img" >/dev/null
           ls -l
-          cd "$GITHUB_WORKSPACE/dist"
+          cd "$GITHUB_WORKSPACE/dist/boot"
           ls -l "$STOCK" boot.img
           sha256sum boot.img | tee boot.img.sha256
 
-      - name: Upload artifacts
+      # Three separate artifacts: kernel (Image/DTBs/config/log), modules, boot.img
+      - name: Upload kernel artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gts6lwifi-kernel-${{ github.run_number }}
-          path: |
-            dist/
-            build.log
+          path: dist/kernel/
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload modules artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gts6lwifi-modules-${{ github.run_number }}
+          path: dist/modules/
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 0   # already a .tar.gz
+
+      - name: Upload boot.img artifact
+        if: always() && steps.stock.outputs.path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: gts6lwifi-boot-img-${{ github.run_number }}
+          path: dist/boot/
           if-no-files-found: warn
           retention-days: 30
