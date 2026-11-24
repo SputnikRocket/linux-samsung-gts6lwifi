@@ -8,9 +8,9 @@ on:
         type: string
         default: gts6lwifi_eur_open_defconfig
       extra_config:
-        description: "Extra Kconfig options, space separated (e.g. CONFIG_RKP_CFP=n CONFIG_SECURITY_DEFEX=n)"
+        description: "Kconfig overrides, space separated. Default turns off Samsung's CFP (needs Qualcomm's private clang; crashes with AOSP clang). Clear it to build the defconfig untouched."
         type: string
-        default: ""
+        default: "CONFIG_RKP_CFP=n CONFIG_RKP_CFP_JOPP=n CONFIG_RKP_CFP_ROPP=n"
       extra_make_args:
         description: "Extra make arguments, space separated"
         type: string
@@ -20,13 +20,17 @@ on:
         type: string
         default: ""
       stock_boot_url:
-        description: "URL of the stock boot.img (only used if stock/boot.img is not in the repo)"
+        description: "URL of the stock boot.img (wins over stock/boot.img in the repo)"
         type: string
         default: ""
       ramdisk_url:
         description: "Optional replacement ramdisk/initramfs URL (cpio, gz, lz4, xz...). Empty = keep the stock ramdisk"
         type: string
         default: ""
+      require_boot_img:
+        description: "Fail immediately if there is no usable stock boot.img. Untick to build only the kernel + modules."
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Qualcomm's LLVM 8 (what Samsung builds with) is not public, so use AOSP's
+  # Qualcomm's LLVM (what Samsung builds with) is not public, so use AOSP's
   # prebuilt clang + GCC 4.9 binutils, which build 4.14 SM8150 trees fine.
   CLANG_VER: clang-r353983c
   CLANG_BRANCH: android10-release
@@ -56,6 +60,7 @@ jobs:
       EXTRA_KCFLAGS: ${{ inputs.extra_kcflags }}
       STOCK_BOOT_URL: ${{ inputs.stock_boot_url || vars.STOCK_BOOT_URL }}
       RAMDISK_URL: ${{ inputs.ramdisk_url || vars.RAMDISK_URL }}
+      REQUIRE_BOOT_IMG: ${{ inputs.require_boot_img }}
 
     steps:
       - name: Checkout kernel source
@@ -68,12 +73,88 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex build-essential libssl-dev libelf-dev libncurses-dev \
-            xz-utils unzip curl git ca-certificates python3 python2 ccache \
+            xz-utils unzip curl git ca-certificates python3 python2 ccache lz4 \
             gcc-arm-linux-gnueabi
-          # Samsung's scripts/rkp_cfp/instrument.py (run after vmlinux links) is Python 2 only,
-          # and the runner's `python` is Python 3. Point `python` at python2 for this job.
+          # Some of Samsung's build helper scripts are Python 2 only and are run as
+          # plain `python`, which on the runner is Python 3. Point it at python2.
           sudo ln -sf /usr/bin/python2 /usr/bin/python
           python --version
+
+      # Checked up front: the compile takes ~25 min, so a missing or placeholder
+      # image should fail in seconds, not after the build.
+      - name: Locate stock boot.img
+        id: stock
+        run: |
+          set -euo pipefail
+          S="$RUNNER_TEMP/stock"; mkdir -p "$S"
+
+          hex() { head -c "$2" "$1" | od -An -tx1 | tr -d ' \n'; }
+
+          # prints one of: android | lz4 | tar | lfs-pointer | too-small | unknown
+          classify() {
+            local f="$1" size
+            size=$(stat -c %s "$f")
+            if [ "$(hex "$f" 8)" = "414e44524f494421" ]; then echo android            # "ANDROID!"
+            elif [ "$size" -lt 1048576 ] && head -c 64 "$f" | grep -qa '^version https://git-lfs'; then echo lfs-pointer
+            elif [ "$size" -lt 1048576 ]; then echo too-small
+            elif [ "$(hex "$f" 4)" = "04224d18" ] || [ "$(hex "$f" 4)" = "02214c18" ]; then echo lz4
+            elif [ "$(dd if="$f" bs=1 skip=257 count=5 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7573746172" ]; then echo tar
+            else echo unknown
+            fi
+          }
+
+          why() {   # why <kind> <file>
+            case "$1" in
+              too-small)   echo "is only $(stat -c %s "$2") bytes, a placeholder rather than a boot image" ;;
+              lfs-pointer) echo "is a Git LFS pointer, not the real file" ;;
+              lz4)         echo "is LZ4-compressed but did not unpack to a boot image" ;;
+              tar)         echo "is a tar archive (Samsung firmware); extract boot.img.lz4 from it first" ;;
+              *)           echo "is not an Android boot image ($(stat -c %s "$2") bytes, starts with $(head -c 8 "$2" | od -An -tx1 | tr -s ' ' | sed 's/^ //'))" ;;
+            esac
+          }
+
+          cands=()
+          if [ -n "${STOCK_BOOT_URL:-}" ]; then
+            if curl -fsSL --retry 3 -o "$S/from-url.bin" "$STOCK_BOOT_URL"; then
+              cands+=("$S/from-url.bin|stock_boot_url")
+            else
+              echo "::warning::could not download stock_boot_url"
+            fi
+          fi
+          if [ -f "$GITHUB_WORKSPACE/$STOCK_BOOT_PATH" ]; then
+            cands+=("$GITHUB_WORKSPACE/$STOCK_BOOT_PATH|$STOCK_BOOT_PATH")
+          fi
+
+          path=""; problems=""
+          for c in "${cands[@]}"; do
+            f="${c%%|*}"; label="${c#*|}"
+            kind=$(classify "$f")
+            if [ "$kind" = lz4 ] && lz4 -d -f -q "$f" "$S/unlz4.img" 2>/dev/null \
+               && [ "$(classify "$S/unlz4.img")" = android ]; then
+              f="$S/unlz4.img"; kind=android
+            fi
+            if [ "$kind" = android ]; then
+              path="$f"
+              echo "Using stock boot image from $label ($(stat -c %s "$f") bytes)"
+              break
+            fi
+            problems+="$label $(why "$kind" "$f"). "
+          done
+
+          if [ -z "$path" ]; then
+            if [ "${#cands[@]}" -eq 0 ]; then
+              msg="No stock boot.img found (expected $STOCK_BOOT_PATH in the repo, or the stock_boot_url input). "
+            else
+              msg="No usable stock boot.img: $problems"
+            fi
+            msg+="Dump it in TWRP with: adb shell dd if=/dev/block/by-name/boot of=/tmp/boot.img, then adb pull /tmp/boot.img. Commit it as $STOCK_BOOT_PATH or host it and pass stock_boot_url."
+            if [ "${REQUIRE_BOOT_IMG:-true}" != "false" ]; then
+              echo "::error title=No usable stock boot.img::$msg (Or re-run with require_boot_img unticked to build only the kernel and modules.)"
+              exit 1
+            fi
+            echo "::warning title=boot.img will be skipped::$msg"
+          fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
 
       - name: Restore toolchain cache
         id: tc-cache
@@ -103,7 +184,8 @@ jobs:
           path: ~/toolchains
           key: toolchains-${{ env.CLANG_VER }}-${{ env.CLANG_BRANCH }}-gcc4.9-${{ env.GCC_BRANCH }}
 
-      # ccache turns the ~13 min full compile into a couple of minutes on re-runs.
+      # ccache cuts re-runs from ~25 min to a few. GitHub evicts caches unused for 7 days,
+      # so the first run after a gap is a full build again.
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
@@ -124,7 +206,7 @@ jobs:
           python --version
 
           # dist/kernel -> "kernel" artifact, dist/modules -> "modules", dist/boot -> "boot-img"
-          mkdir -p dist/kernel/dtbs dist/modules dist/boot
+          mkdir -p dist/kernel dist/modules dist/boot
           LOG=dist/kernel/build.log
 
           if [ ! -f "arch/arm64/configs/$DEFCONFIG" ]; then
@@ -177,23 +259,27 @@ jobs:
           ccache -s | head -n 12 || true
           [ "$rc" -eq 0 ] || exit "$rc"
 
+          # Samsung's post-link helper scripts (python) can crash without failing make
+          # (their worker processes die on their own), leaving a half-processed vmlinux.
+          if grep -qE '^Traceback \(most recent call last\)' "$LOG"; then
+            echo "::error title=Build helper script crashed::make exited 0 but build.log contains a Python traceback, so the kernel is not trustworthy. If it is RKP_CFP (scripts/rkp_cfp/instrument.py), set CONFIG_RKP_CFP=n CONFIG_RKP_CFP_JOPP=n CONFIG_RKP_CFP_ROPP=n in extra_config."
+            exit 1
+          fi
+
           # ---- collect outputs ----
           B=out/arch/arm64/boot
           [ -f "$B/Image" ] || { echo "::error::build finished without producing $B/Image"; exit 1; }
-
-          # Samsung's default target doesn't build the DTBs (the appended-DTB list in the
-          # defconfig is empty), so build them explicitly if none exist yet.
-          ndtb=$(find "$B/dts" -name '*.dtb' 2>/dev/null | wc -l)
-          if [ "$ndtb" -eq 0 ]; then
-            echo "::group::make dtbs"
-            make -k "${make_args[@]}" dtbs 2>&1 | tee -a "$LOG" || echo "::warning::dtbs target failed"
-            echo "::endgroup::"
-          fi
-
+          # Image-dtb = Samsung's 'UNCOMPRESSED_IMG' header + Image (+ any appended DTBs).
+          # This tree builds no DTBs: the device tree comes from the dtbo partition.
           for f in Image Image.gz Image.gz-dtb Image-dtb; do
             if [ -f "$B/$f" ]; then cp "$B/$f" dist/kernel/; fi
           done
-          find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) -exec cp -t dist/kernel/dtbs {} + || true
+          mapfile -t built_dt < <(find "$B/dts" \( -name '*.dtb' -o -name '*.dtbo' \) 2>/dev/null)
+          if [ "${#built_dt[@]}" -gt 0 ]; then
+            mkdir -p dist/kernel/dtbs && cp -t dist/kernel/dtbs "${built_dt[@]}"
+          else
+            echo "No .dtb/.dtbo files were built (expected for this tree)."
+          fi
           cp out/.config dist/kernel/config
           make "${make_args[@]}" -s kernelrelease 2>/dev/null | tail -n1 > dist/kernel/kernelrelease.txt || true
 
@@ -210,7 +296,7 @@ jobs:
               echo "::warning::modules_install failed (continuing)"
             fi
           fi
-          ls -lh dist/kernel dist/kernel/dtbs dist/modules
+          ls -lh dist/kernel dist/modules
 
       - name: Save ccache
         if: always()
@@ -233,24 +319,6 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Locate stock boot.img
-        id: stock
-        run: |
-          set -euo pipefail
-          path=""
-          if [ -f "$STOCK_BOOT_PATH" ]; then
-            path="$GITHUB_WORKSPACE/$STOCK_BOOT_PATH"
-          elif [ -n "${STOCK_BOOT_URL:-}" ]; then
-            curl -fL --retry 3 -o "$RUNNER_TEMP/stock-boot.img" "$STOCK_BOOT_URL"
-            path="$RUNNER_TEMP/stock-boot.img"
-          fi
-          if [ -n "$path" ]; then
-            head -c 8 "$path" | grep -q 'ANDROID!' || { echo "::error::$path is not an Android boot image"; exit 1; }
-          else
-            echo "::notice::No stock boot.img (stock/boot.img or STOCK_BOOT_URL) - skipping boot.img repack"
-          fi
-          echo "path=$path" >> "$GITHUB_OUTPUT"
-
       - name: Repack boot.img
         if: steps.stock.outputs.path != ''
         env:
@@ -268,24 +336,13 @@ jobs:
           chmod +x "$WORK/magiskboot"
           MB="$WORK/magiskboot"
 
-          # All built DTBs for this device, concatenated (the bootloader picks by board-id/rev)
-          dtb_blob() {
-            mapfile -t files < <(find "$B/dts" -name "$DTB_GLOB" | sort)
-            if [ "${#files[@]}" -eq 0 ]; then
-              echo "::warning::no DTB matched $DTB_GLOB, using every .dtb" >&2
-              mapfile -t files < <(find "$B/dts" -name '*.dtb' | sort)
-            fi
-            [ "${#files[@]}" -gt 0 ] || { echo "::error::no .dtb files were built" >&2; return 1; }
-            cat "${files[@]}"
-          }
-
           cd "$WORK/unpacked"
           "$MB" unpack -h "$STOCK" 2>&1 | tee ../unpack.log
           echo "--- stock components ---"; ls -l
 
           [ -f kernel ] || { echo "::error::no kernel component found in the stock boot.img"; exit 1; }
 
-          # Qualcomm SM8150 kernels can be shipped uncompressed behind a 'UNCOMPRESSED_IMG'
+          # Samsung SM8150 kernels are shipped uncompressed behind a 'UNCOMPRESSED_IMG'
           # header (the kernel build emits that as Image-dtb). If the stock image does that,
           # the replacement must too; otherwise give magiskboot the raw Image and let it
           # recompress to the original format.
@@ -298,14 +355,21 @@ jobs:
             cp "$B/Image" kernel
           fi
 
+          # Only relevant if the stock image carries its DTB separately (kernel_dtb / dtb).
+          # If this build produced none, keep the stock one rather than failing.
           if [ -f kernel_dtb ] || [ -f dtb ]; then
-            dtb_blob > "$WORK/dtb.new"
-            [ -s "$WORK/dtb.new" ] || { echo "::error::empty DTB blob"; exit 1; }
-            [ "$(head -c 4 "$WORK/dtb.new" | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ] || { echo "::error::DTB blob has no FDT magic"; exit 1; }
-            if [ -f kernel_dtb ]; then cp "$WORK/dtb.new" kernel_dtb; fi
-            if [ -f dtb ]; then cp "$WORK/dtb.new" dtb; fi
+            mapfile -t dtbs < <(find "$B/dts" -name "$DTB_GLOB" 2>/dev/null | sort)
+            [ "${#dtbs[@]}" -gt 0 ] || mapfile -t dtbs < <(find "$B/dts" -name '*.dtb' 2>/dev/null | sort)
+            if [ "${#dtbs[@]}" -gt 0 ]; then
+              cat "${dtbs[@]}" > "$WORK/dtb.new"
+              [ "$(head -c 4 "$WORK/dtb.new" | od -An -tx1 | tr -d ' \n')" = "d00dfeed" ] || { echo "::error::DTB blob has no FDT magic"; exit 1; }
+              if [ -f kernel_dtb ]; then cp "$WORK/dtb.new" kernel_dtb; fi
+              if [ -f dtb ]; then cp "$WORK/dtb.new" dtb; fi
+            else
+              echo "::warning::this build produced no DTBs; keeping the stock image's DTB"
+            fi
           else
-            echo "::warning::stock boot.img has no separate DTB component; DTBs (if any) stay inside the kernel image"
+            echo "Stock boot.img has no separate DTB component (the device tree comes from dtbo), nothing to replace."
           fi
 
           if [ -n "${RAMDISK_URL:-}" ]; then
@@ -327,7 +391,7 @@ jobs:
           ls -l "$STOCK" boot.img
           sha256sum boot.img | tee boot.img.sha256
 
-      # Three separate artifacts: kernel (Image/DTBs/config/log), modules, boot.img
+      # Three separate artifacts: kernel (Image/config/log), modules, boot.img
       - name: Upload kernel artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -338,20 +402,18 @@ jobs:
           retention-days: 30
 
       - name: Upload modules artifact
-        if: always()
+        if: always() && hashFiles('dist/modules/*') != ''
         uses: actions/upload-artifact@v4
         with:
           name: gts6lwifi-modules-${{ github.run_number }}
           path: dist/modules/
-          if-no-files-found: warn
           retention-days: 30
           compression-level: 0   # already a .tar.gz
 
       - name: Upload boot.img artifact
-        if: always() && steps.stock.outputs.path != ''
+        if: always() && hashFiles('dist/boot/boot.img') != ''
         uses: actions/upload-artifact@v4
         with:
           name: gts6lwifi-boot-img-${{ github.run_number }}
           path: dist/boot/
-          if-no-files-found: warn
           retention-days: 30
